@@ -2,10 +2,10 @@
 #include <SPI.h>
 
 #define MAX_TEMP  700
-#define MIN_TEMP  30
+#define MIN_TEMP  20
 
-#define PID_P   2.8
-#define PID_I   0.6
+#define PID_P   15.5
+#define PID_I   0.85
 #define PID_D   0.2
 
 #define MAX_VAL 93
@@ -13,18 +13,19 @@
 
 #define BUTTON_TIMER  250 // in miliseconds
 #define ENC_TIMER     5000  // in miliseconds
+#define SENSOR_PERIOD 250 // in miliseconds
+#define PID_PERIOD    1000
 
 #define CS          PA8
 #define HEATER_PIN  PC13
-#define ZERO_DETECT PA4
+#define ZERO_DETECT PB15
 #define LED_PIN     PC14
 
 #define ENC_A       PA1
 #define ENC_B       PA2
-#define ENC_SW      PB15
+#define ENC_SW      PA4
 encoder_t *enc = NULL;
 
-#define SENSOR_PERIOD 250 // in miliseconds
 
 struct encoder_t {
     uint8_t a_pin;
@@ -47,19 +48,20 @@ LiquidCrystal lcd(RS, EN, D4, D5, D6, D7);
 //*****************************************************************************
 
 int16_t set = 30;         // variable for setted temparature
-char buff_1[17];          // buffer for second line of LCD
-char buff_2[17];          // buffer for first line of LCD
+char buff_1[20];          // buffer for second line of LCD
+char buff_2[20];          // buffer for first line of LCD
 bool upd_screen = false;  // flag for updating screen
-uint8_t period_for_sensor = 250;
-uint16_t temp_raw = 0;    // raw value of temperature
-uint16_t temp = 0;        // filtered value of temperature
-uint8_t cnt = 0;          // counter for dimmer
+uint16_t period_for_sensor = 250;
+int16_t temp_raw = 0;    // raw value of temperature
+int16_t temp = 0;        // filtered value of temperature
+uint16_t cnt = 0;          // counter for dimmer
 uint16_t val = 50;         // value for comparing to cnt
 uint8_t btn_cnt = 0;
-uint8_t btn_delay = 0;
+uint16_t btn_delay = 0;
 bool enc_enable = false;
 uint8_t power_koef = 0;
-uint8_t enc_delay = 0;
+uint16_t enc_delay = 0;
+uint16_t pid_cnt = PID_PERIOD;
 
 void setup() {
 
@@ -70,7 +72,7 @@ void setup() {
     attachInterrupt(ZERO_DETECT, EXT_INT0, RISING);
 
     pinMode(ENC_SW, INPUT);
-    attachInterrupt(ENC_SW, EXT_INT1, RISING);
+    attachInterrupt(ENC_SW, EXT_INT1, FALLING);
 
     enc = (encoder_t*)malloc(sizeof(enc));
     enc_init(enc);
@@ -103,27 +105,34 @@ void loop() {
 
     if (enc_check_state(enc)) {
         int8_t tmp_delta = enc_get_delta(enc);
-        set = constrain(set+tmp_delta, 30, 700);      
+        set = constrain(set+tmp_delta, MIN_TEMP, MAX_TEMP);      
         upd_screen = true;
         enc_delay = ENC_TIMER;
+    }
+
+    if(!pid_cnt) {
+        val = computePID((float)temp_raw, (float)set, PID_P, PID_I, PID_D, 1, MIN_VAL, MAX_VAL);
+        upd_screen = true;
+        pid_cnt = PID_PERIOD;   
     }
 
     if (!period_for_sensor) {
       
         temp_raw = MAX6675_read();
-        temp = (1 - 0.2) * (double)temp + 0.2 * (double)temp_raw;
-        val = computePID(temp, set, PID_P, PID_I, PID_D, 0.25, MIN_VAL, MAX_VAL);
+        //temp = (1 - 0.5) * (float)temp + 0.5 * (float)temp_raw;
+        //val = computePID((float)temp_raw, (float)set, PID_P, PID_I, PID_D, 1, MIN_VAL, MAX_VAL);
         upd_screen = true;
         period_for_sensor = SENSOR_PERIOD;
     }
 
 
     if (upd_screen) {
-        sprintf(buff_1, "temp=%d/%dCdeg", temp, set);
+        sprintf(buff_1, "temp=%d/%dCdeg", temp_raw, set);
 
-        power_koef = (4 == val) ? 0 : (val*100) / (MAX_VAL + MIN_VAL);
+        power_koef = (4 == val) ? 0 : ((val*100) / (MAX_VAL + MIN_VAL));
         
         sprintf(buff_2, "PowKoef=%d", power_koef);
+        //sprintf(buff_2, "val=%d", val);
         
         Timer2.pause();
         lcd.clear();
@@ -137,7 +146,8 @@ void loop() {
             lcd.print("E");
         else
             lcd.print(" ");
-        
+
+        Timer2.refresh();
         Timer2.resume();
         upd_screen = false;
     }
@@ -165,13 +175,16 @@ void TIMER2_COMPA(void)
 
     if (period_for_sensor > 0)
       period_for_sensor--;
+
+    if (pid_cnt > 0)
+      pid_cnt--;
 }
 
 //*****************************************************************************
 // TIMER WITH PERIOD 100 MICROSECONDS
 //*****************************************************************************
 
-void TIMER3_COMPA()
+void TIMER3_COMPA(void)
 {
     if(cnt != 0) {
         cnt--;
@@ -199,20 +212,26 @@ void EXT_INT0(void)
 
 void EXT_INT1(void)
 {
+
+  Timer2.pause();
     if (!enc_enable) {
       btn_cnt++;
       btn_delay = BUTTON_TIMER;
   
-      if(3 == btn_cnt) {
+      if(2 == btn_cnt) {
+        btn_cnt = 0;
         enc_enable = true;
         enc_delay = ENC_TIMER;
       }      
     }
+
+    Timer2.refresh();
+    Timer2.resume();
 }
 
 //-----------------------------------------------------------------------------
 
-uint16_t MAX6675_read()
+uint16_t MAX6675_read(void)
 {
   uint8_t a1 = 0;
   uint8_t a2 = 0;
@@ -320,15 +339,16 @@ int8_t enc_get_delta(struct encoder_t *enc)
 
 //-----------------------------------------------------------------------------
 
-int computePID(uint16_t input, uint16_t setpoint, float kp, float ki, float kd, float dt, uint16_t minOut, uint16_t maxOut) 
+uint16_t computePID(float input, float setpoint, float kp, float ki, float kd, float dt, uint16_t minOut, uint16_t maxOut) 
 {
 
-    float err = (float)setpoint - (float)input;
+    float err = setpoint - input;
+    float prop = err * kp >= maxOut ? maxOut :  err * kp;
     static float integral = 0, prevErr = 0;
 
-    integral = constrain((integral + (float)err * dt * ki), (int16_t)minOut, (int16_t)maxOut);
+    integral = constrain((integral + (float)err * dt * ki), -(int16_t)maxOut, (int16_t)maxOut);
 
     float Diff = (err - prevErr) / dt;
     prevErr = err;
-    return constrain(err * kp + integral + Diff * kd, minOut, maxOut);
+    return constrain(prop + integral + Diff * kd, minOut, maxOut);
 }
